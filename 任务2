@@ -1,0 +1,159 @@
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from torchvision.models import resnet18
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.models.vision_transformer import VisionTransformer, ViT_B_16_Weights
+
+# 数据增强策略，包括CutMix
+class CutMix(object):
+    def __init__(self, beta=1.0, prob=0.5):
+        self.beta = beta
+        self.prob = prob
+
+    def __call__(self, x, y):
+        if np.random.rand(1) < self.prob:
+            lam = np.random.beta(self.beta, self.beta)
+            rand_index = torch.randperm(x.size()[0])
+            target_a = y
+            target_b = y[rand_index]
+            bbx1, bby1, bbx2, bby2 = self.rand_bbox(x.size(), lam)
+            x[:, :, bbx1:bbx2, bby1:bby2] = x[rand_index, :, bbx1:bbx2, bby1:bby2]
+            lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
+            return x, target_a, target_b, lam
+        else:
+            return x, y, y, 1.0
+
+    def rand_bbox(self, size, lam):
+        W = size[2]
+        H = size[3]
+        cut_rat = np.sqrt(1. - lam)
+        cut_w = int(W * cut_rat)
+        cut_h = int(H * cut_rat)
+
+        cx = np.random.randint(W)
+        cy = np.random.randint(H)
+
+        bbx1 = np.clip(cx - cut_w // 2, 0, W)
+        bby1 = np.clip(cy - cut_h // 2, 0, H)
+        bbx2 = np.clip(cx + cut_w // 2, 0, W)
+        bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+        return bbx1, bby1, bbx2, bby2
+
+transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomCrop(32, padding=4),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+])
+
+trainset = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform)
+testset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform)
+
+trainloader = DataLoader(trainset, batch_size=64, shuffle=True)
+testloader = DataLoader(testset, batch_size=64, shuffle=False)
+
+# 定义ResNet模型
+cnn_model = resnet18(num_classes=100)
+
+# 修改ViT模型以适应CIFAR-100数据集
+class CustomViT(VisionTransformer):
+    def __init__(self, image_size=32, patch_size=4, num_classes=100, num_layers=12, num_heads=12, hidden_dim=768, mlp_dim=3072):
+        super(CustomViT, self).__init__(
+            image_size=image_size, 
+            patch_size=patch_size, 
+            num_layers=num_layers, 
+            num_heads=num_heads, 
+            hidden_dim=hidden_dim, 
+            mlp_dim=mlp_dim,
+            num_classes=num_classes,
+        )
+        # 修改输入层，使其适应32x32图像
+        self.conv_proj = nn.Conv2d(3, self.conv_proj.out_channels, kernel_size=4, stride=4, padding=0)
+        # 修改输出层
+        if hasattr(self, 'head'):
+            self.head = nn.Linear(self.head.in_features, num_classes)
+        elif hasattr(self, 'fc'):
+            self.fc = nn.Linear(self.fc.in_features, num_classes)
+
+# 使用自定义的ViT模型
+transformer_model = CustomViT(image_size=32, patch_size=4, num_classes=100)
+
+def train_model(model, trainloader, testloader, device, writer, model_name):
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    model.to(device)
+
+    epochs = 50
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        total = 0
+        correct = 0
+        for i, data in enumerate(trainloader, 0):
+            inputs, labels = data
+            cutmix = CutMix()
+            inputs, targets_a, targets_b, lam = cutmix(inputs, labels)
+            inputs, targets_a, targets_b = inputs.to(device), targets_a.to(device), targets_b.to(device)
+
+            optimizer.zero_grad()
+
+            outputs = model(inputs)
+            loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (lam * predicted.eq(targets_a.data).cpu().sum().float() + (1 - lam) * predicted.eq(targets_b.data).cpu().sum().float()).item()
+
+            if i % 200 == 199:
+                print(f'[{epoch + 1}, {i + 1}] loss: {running_loss / 200:.3f}')
+                writer.add_scalar(f'Loss/train_{model_name}', running_loss / 200, epoch * len(trainloader) + i)
+                running_loss = 0.0
+
+        print(f'Epoch {epoch+1}, Accuracy: {100 * correct / total}%')
+
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for data in testloader:
+                inputs, labels = data
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+
+        val_accuracy = 100 * val_correct / val_total
+        print(f'Epoch {epoch+1}, Val Accuracy: {val_accuracy}%')
+        writer.add_scalar(f'Loss/val_{model_name}', val_loss / len(testloader), epoch)
+        writer.add_scalar(f'Accuracy/val_{model_name}', val_accuracy, epoch)
+
+    print('Finished Training')
+    writer.flush()
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# 使用Tensorboard进行可视化
+writer_cnn = SummaryWriter('runs/CNN')
+writer_transformer = SummaryWriter('runs/Transformer')
+
+print("Training CNN model...")
+train_model(cnn_model, trainloader, testloader, device, writer_cnn, 'CNN')
+print("Training Transformer model...")
+train_model(transformer_model, trainloader, testloader, device, writer_transformer, 'Transformer')
+
+# 保存模型
+torch.save(cnn_model.state_dict(), 'final_cnn_model2.pth')
+torch.save(transformer_model.state_dict(), 'final_transformer_model.pth')

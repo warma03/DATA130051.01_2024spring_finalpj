@@ -1,0 +1,252 @@
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torchvision.models import resnet18
+from torch.utils.data import DataLoader
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+
+# SimCLR Model
+class SimCLR(nn.Module):
+    def __init__(self, base_encoder, projection_dim=128):
+        super(SimCLR, self).__init__()
+        self.encoder = base_encoder(weights=None)  # Update to use weights parameter
+        self.encoder.fc = nn.Sequential(
+            nn.Linear(self.encoder.fc.in_features, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, projection_dim)
+        )
+
+    def forward(self, x):
+        return self.encoder(x)
+
+# Contrastive Loss Function
+class NTXentLoss(nn.Module):
+    def __init__(self, batch_size, temperature, use_cosine_similarity):
+        super(NTXentLoss, self).__init__()
+        self.batch_size = batch_size
+        self.temperature = temperature
+        self.use_cosine_similarity = use_cosine_similarity
+        self.similarity_function = nn.CosineSimilarity(dim=2) if use_cosine_similarity else nn.PairwiseDistance(p=2)
+        self.criterion = nn.CrossEntropyLoss(reduction="sum")
+
+    def forward(self, z_i, z_j):
+        N = 2 * z_i.size(0)  # Use the actual batch size
+        z = torch.cat((z_i, z_j), dim=0)
+        similarity_matrix = self.similarity_function(z.unsqueeze(1), z.unsqueeze(0)) / self.temperature
+
+        # Create labels
+        labels = torch.arange(N).cuda()
+        labels = (labels + z_i.size(0)) % N  # Use the actual batch size
+
+        mask = torch.eye(N, dtype=torch.bool).cuda()
+        similarity_matrix = similarity_matrix.masked_fill(mask, float('-inf'))
+
+        loss = self.criterion(similarity_matrix, labels)
+        loss /= N
+        return loss
+
+# Data augmentations for SimCLR
+train_transforms = transforms.Compose([
+    transforms.RandomResizedCrop(size=32),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomApply([transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1)], p=0.8),
+    transforms.RandomGrayscale(p=0.2),
+    transforms.ToTensor()
+])
+
+# Load CIFAR-100 dataset
+train_dataset = torchvision.datasets.CIFAR100(root='./data', train=True, transform=train_transforms, download=True)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+
+# Initialize SimCLR model
+model = SimCLR(base_encoder=resnet18).cuda()
+
+# Loss and optimizer
+criterion = NTXentLoss(batch_size=32, temperature=0.5, use_cosine_similarity=True).cuda()  # Update batch size
+optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-6)
+scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
+
+# SimCLR training loop
+for epoch in range(50):
+    model.train()
+    total_loss = 0
+    for i, (images, _) in enumerate(train_loader):
+        images = images.cuda()
+        batch_size = images.size(0)
+
+        # Create augmented views
+        images = torch.cat([images, images], dim=0)
+        
+        # Forward pass
+        features = model(images)
+        z_i, z_j = torch.split(features, batch_size, dim=0)
+        
+        loss = criterion(z_i, z_j)
+        total_loss += loss.item()
+
+        # Backward pass and optimization
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    avg_loss = total_loss / len(train_loader)
+    print(f"Epoch [{epoch+1}/50], Loss: {avg_loss:.4f}")
+    scheduler.step()
+
+torch.save(model.state_dict(), 'simclr_resnet18.pth')
+
+# Load pretrained model
+model = SimCLR(base_encoder=resnet18)
+model.load_state_dict(torch.load('simclr_resnet18.pth'))
+model.encoder.fc = nn.Identity()  # Remove projection head for linear evaluation
+model.eval().cuda()
+
+# Linear evaluation setup
+linear_layer = nn.Linear(128, 100).cuda()
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(linear_layer.parameters(), lr=1e-3, weight_decay=1e-6)
+scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
+test_dataset = torchvision.datasets.CIFAR100(root='./data', train=False, transform=transforms.ToTensor(), download=True)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=4)
+
+# Linear evaluation loop
+for epoch in range(50):
+    model.eval()
+    linear_layer.train()
+    for images, labels in train_loader:
+        images, labels = images.cuda(), labels.cuda()
+        
+        with torch.no_grad():
+            features = model(images)
+        
+        outputs = linear_layer(features)
+        loss = criterion(outputs, labels)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print(f"Epoch [{epoch+1}/50], Loss: {loss.item():.4f}")
+    scheduler.step()
+
+# Evaluate
+model.eval()
+linear_layer.eval()
+correct = 0
+total = 0
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.cuda(), labels.cuda()
+        features = model(images)
+        outputs = linear_layer(features)
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+accuracy = 100 * correct / total
+print(f'Test Accuracy: {accuracy:.2f}%')
+
+# Supervised training from scratch
+supervised_model = resnet18(num_classes=100).cuda()
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(supervised_model.parameters(), lr=1e-3, weight_decay=1e-6)
+scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
+
+train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=4)
+
+# Supervised training loop
+for epoch in range(50):
+    supervised_model.train()
+    for images, labels in train_loader:
+        images, labels = images.cuda(), labels.cuda()
+        
+        outputs = supervised_model(images)
+        loss = criterion(outputs, labels)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print(f"Epoch [{epoch+1}/50], Loss: {loss.item():.4f}")
+    scheduler.step()
+
+# Evaluate
+supervised_model.eval()
+correct = 0
+total = 0
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.cuda(), labels.cuda()
+        outputs = supervised_model(images)
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+accuracy = 100 * correct / total
+print(f'Test Accuracy: {accuracy:.2f}%')
+
+from torch.utils.tensorboard import SummaryWriter
+
+# Initialize Tensorboard
+writer = SummaryWriter()
+
+# Modify training loop to log loss and accuracy
+for epoch in range(50):
+    model.train()
+    total_loss = 0
+    for i, batch in enumerate(train_loader):
+        images, _ = batch
+        images = images.cuda()
+        
+        outputs = model(images)
+        loss = criterion(outputs, outputs)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        
+        if (i + 1) % 10 == 0:
+            print(f"Epoch [{epoch+1}/50], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
+    
+    avg_loss = total_loss / len(train_loader)
+    writer.add_scalar('Loss/train', avg_loss, epoch)
+
+# Linear evaluation loop with Tensorboard logging
+for epoch in range(1):
+    model.eval()
+    linear_layer.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    for images, labels in train_loader:
+        images, labels = images.cuda(), labels.cuda()
+        
+        with torch.no_grad():
+            features = model(images)
+        
+        outputs = linear_layer(features)
+        loss = criterion(outputs, labels)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+    
+    avg_loss = total_loss / len(train_loader)
+    accuracy = 100 * correct / total
+    writer.add_scalar('Loss/linear_eval', avg_loss, epoch)
+    writer.add_scalar('Accuracy/linear_eval', accuracy, epoch)
+
+# Close Tensorboard writer
+writer.close()

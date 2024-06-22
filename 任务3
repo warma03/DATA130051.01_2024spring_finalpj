@@ -1,46 +1,46 @@
-# 下载并准备NeRF实现框架
+# Download and prepare the NeRF implementation framework
 !git clone https://github.com/bmild/nerf.git
 %cd nerf
 
 import shutil
 import os
 
-# 设定数据集路径和目标路径
+# Set dataset path and target path
 camera_params_path = 'model1.ini'
 images_path = 'bottle'
 target_path = 'your_dataset'
 
-# 创建目标路径
+# Create the target path
 os.makedirs(target_path, exist_ok=True)
 
-# 拷贝相机参数文件
+# Copy camera parameters file
 shutil.copy(camera_params_path, os.path.join(target_path, 'camera_params.ini'))
 
-# 拷贝图片文件
+# Copy image files
 for file_name in os.listdir(images_path):
     full_file_name = os.path.join(images_path, file_name)
     if os.path.isfile(full_file_name):
         shutil.copy(full_file_name, target_path)
 
-# 修改配置文件和训练脚本
+# Modify the config file and training script
 config_content = """
 data_dir = ./data/nerf_synthetic/your_dataset
 ...
 """
-with open('your_config.txt', 'w') as config_file:
+with open('configs/your_config.txt', 'w') as config_file:
     config_file.write(config_content)
 
-# 训练NeRF模型
+# Train the NeRF model
 !python run_nerf.py --config ./configs/your_config.txt
 
-# 使用TensorBoard进行训练过程的可视化
+# Visualize the training process using TensorBoard
 from tensorboard import notebook
 notebook.start("--logdir logs")
 
-# 渲染新视图
+# Render new views
 !python run_nerf.py --config ./configs/your_config.txt --render_only
 
-# 定量评估，计算PSNR
+# Quantitative evaluation, compute PSNR
 import torch
 import numpy as np
 from skimage.metrics import peak_signal_noise_ratio as psnr
@@ -63,6 +63,6 @@ rendered_image_path = 'path/to/rendered_image.png'
 test_image = load_image(test_image_path)
 rendered_image = load_image(rendered_image_path)
 
-# 计算PSNR
+# Compute PSNR
 psnr_value = compute_psnr(test_image, rendered_image)
 print(f"PSNR: {psnr_value}")
